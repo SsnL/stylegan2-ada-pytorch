@@ -207,24 +207,34 @@ class GManager(object):
 
 class Saver(object):
     def __init__(self, ty, save_dir):
-        assert ty in {'raw_tensor', 'min_max_unnorm', 'pm1_unnorm'}
         self.ty = ty
         self.save_dir = save_dir
+        if ty not in {'raw_tensor', 'min_max_unnorm', 'pm1_unnorm'}:
+            import scipy.io
+            outstats, tgtstats = ty.split('=>')
+            self.output_stats = scipy.io.loadmat(outstats)
+            self.target_stats = scipy.io.loadmat(tgtstats)
 
     def save(self, output_tensor, idx):
         save_file_wo_ext = os.path.join(self.save_dir, f'{idx:06d}')
         if self.ty == 'raw_tensor':
-            torch.save(output_tensor, save_file_wo_ext + '.pth')
+            torch.save(output_tensor.cpu(), save_file_wo_ext + '.pth')
             return
 
         img = output_tensor
         if self.ty == 'min_max_unnorm':
             img -= img.flatten(1, 2).min(dim=1).values[:, None, None]
             img /= img.flatten(1, 2).max(dim=1).values[:, None, None]
-            img = (img.permute(1, 2, 0) * 255).clamp(0, 255).to(torch.uint8)
-        else:
-            # self.ty == 'pm1_unnorm'
+            img = (img.permute(1, 2, 0) * 255 + 0.5).clamp(0, 255).to(torch.uint8)
+        elif self.ty == 'pm1_unnorm':
             img = (img.permute(1, 2, 0) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+        else:
+            img = img.permute(1, 2, 0).flatten(0, 1)
+            img = (img - self.output_stats['mu']) @ self.output_stats['w']
+            img = img @ self.stats['winv'] + self.stats['mu']
+            img = img.reshape(*output_tensor)
+            img = (img * 255 + 0.5).clamp(0, 255).to(torch.uint8)
+
         PIL.Image.fromarray(img.cpu().numpy(), 'RGB').save(save_file_wo_ext + '.png')
 
 def sample(G_kwargs, init_seed,
