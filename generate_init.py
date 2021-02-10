@@ -35,6 +35,7 @@ def setup_sampling_kwargs(
     # General options (not included in desc).
     gpus       = None, # Number of GPUs: <int>, default = 1 gpu
     init_seed  = None, # Random seed: <int>, default = 0
+    out_subdir = None, # <str>
 
     # Base config.
     cfg        = None, # Base config: 'auto' (default), 'stylegan2', 'paper256', 'paper512', 'paper1024', 'cifar'
@@ -124,7 +125,11 @@ def setup_sampling_kwargs(
         reinit_sample_interval = None
     args.reinit_sample_interval = reinit_sample_interval
     args.save_ty = save_ty
-    desc += f'-n{len(sampling_seeds)}-psi{truncation_psi:g}-noise{noise_mode}-{save_ty}'
+    desc += f'-n{len(sampling_seeds)}-psi{truncation_psi:g}-noise{noise_mode}'
+    if '=>' in save_ty:
+        desc += '-stats'
+    else:
+        desc += f'-{save_ty}'
     if args.reinit_sample_interval is not None:
         desc += f'-reinit{reinit_sample_interval}'
 
@@ -150,6 +155,9 @@ def setup_sampling_kwargs(
     assert isinstance(nobench, bool)
     if nobench:
         args.cudnn_benchmark = False
+
+    if out_subdir is not None:
+        desc += f"/{out_subdir}"
 
     return desc, args
 
@@ -212,8 +220,12 @@ class Saver(object):
         if ty not in {'raw_tensor', 'min_max_unnorm', 'pm1_unnorm'}:
             import scipy.io
             outstats, tgtstats = ty.split('=>')
-            self.output_stats = scipy.io.loadmat(outstats)
-            self.target_stats = scipy.io.loadmat(tgtstats)
+            self.output_stats = {
+                    k: torch.as_tensor(v) if isinstance(v, np.ndarray) else v for k, v in scipy.io.loadmat(outstats).items()
+            }
+            self.target_stats = {
+                    k: torch.as_tensor(v) if isinstance(v, np.ndarray) else v for k, v in scipy.io.loadmat(tgtstats).items()
+            }
 
     def save(self, output_tensor, idx):
         save_file_wo_ext = os.path.join(self.save_dir, f'{idx:06d}')
@@ -230,9 +242,10 @@ class Saver(object):
             img = (img.permute(1, 2, 0) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         else:
             img = img.permute(1, 2, 0).flatten(0, 1)
+            img = img.cpu()
             img = (img - self.output_stats['mu']) @ self.output_stats['w']
-            img = img @ self.stats['winv'] + self.stats['mu']
-            img = img.reshape(*output_tensor)
+            img = img @ self.target_stats['winv'] + self.target_stats['mu']
+            img = img.reshape(*output_tensor.shape[1:], output_tensor.shape[0])
             img = (img * 255 + 0.5).clamp(0, 255).to(torch.uint8)
 
         PIL.Image.fromarray(img.cpu().numpy(), 'RGB').save(save_file_wo_ext + '.png')
@@ -346,6 +359,8 @@ class num_range:
 
 # General options.
 @click.option('--outdir', help='Where to save the results', required=True, metavar='DIR')
+@click.option('--no-auto-outdir-folder', help='Skip automatically adding a folder under outdir as output, but use outdir directly', is_flag=True)
+@click.option('--out_subdir')
 @click.option('--gpus', help='Number of GPUs to use [default: 1]', type=int, metavar='INT')
 @click.option('--init_seed', help='Random seed [default: 0]', type=int, metavar='INT')
 @click.option('-n', '--dry-run', help='Print training options and exit', is_flag=True)
@@ -367,7 +382,7 @@ class num_range:
 @click.option('--nhwc', help='Use NHWC memory format with FP16', type=bool, metavar='BOOL')
 @click.option('--nobench', help='Disable cuDNN benchmarking', type=bool, metavar='BOOL')
 
-def main(ctx, outdir, dry_run, **config_kwargs):
+def main(ctx, outdir, no_auto_outdir_folder, dry_run, **config_kwargs):
     """Train a GAN using the techniques described in the paper
     "Training Generative Adversarial Networks with Limited Data".
 
@@ -420,14 +435,17 @@ def main(ctx, outdir, dry_run, **config_kwargs):
         ctx.fail(err)
 
     # Pick output directory.
-    prev_run_dirs = []
-    if os.path.isdir(outdir):
-        prev_run_dirs = [x for x in os.listdir(outdir) if os.path.isdir(os.path.join(outdir, x))]
-    prev_run_ids = [re.match(r'^\d+', x) for x in prev_run_dirs]
-    prev_run_ids = [int(x.group()) for x in prev_run_ids if x is not None]
-    cur_run_id = max(prev_run_ids, default=-1) + 1
-    args.run_dir = os.path.join(outdir, f'{cur_run_id:05d}-{run_desc}')
-    assert not os.path.exists(args.run_dir)
+    if no_auto_outdir_folder:
+        args.run_dir = outdir
+    else:
+        prev_run_dirs = []
+        if os.path.isdir(outdir):
+            prev_run_dirs = [x for x in os.listdir(outdir) if os.path.isdir(os.path.join(outdir, x))]
+        prev_run_ids = [re.match(r'^\d+', x) for x in prev_run_dirs]
+        prev_run_ids = [int(x.group()) for x in prev_run_ids if x is not None]
+        cur_run_id = max(prev_run_ids, default=-1) + 1
+        args.run_dir = os.path.join(outdir, f'{cur_run_id:05d}-{run_desc}')
+        assert not os.path.exists(args.run_dir)
 
     # Print options.
     import pprint
